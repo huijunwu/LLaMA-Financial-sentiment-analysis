@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import queue
 import torchvision
 import warnings
+# FairScale is a PyTorch extension library for high performance and large scale training on one or multiple machines/nodes
+# FullyShardedDataParallel (FSDP) is the recommended method for scaling to large NN models. This library has been upstreamed to PyTorch.
 from fairscale.nn.model_parallel.initialize import (
     get_data_parallel_rank,
     get_model_parallel_rank,
@@ -54,25 +56,37 @@ from torchsummary import summary
 warnings.filterwarnings("ignore", category=UserWarning)
 
 def log(msg, logfile, rank):
-    if rank == 0:
+    '''
+    print and append to log if rank is 0
+    '''
+    if rank == 0: # is this rank local or global? - global
         print(msg)
-        with open(logfile, 'a+') as fp:
+        with open(logfile, 'a+') as fp: # append to log file
             fp.write(msg+'\n')
 
 def save_checkpoint(checkpoint_dir, model, optimizer, rope_freqs=None, **kwargs):
-    if os.path.isdir(checkpoint_dir) == False:
-        os.system(f'mkdir -p {checkpoint_dir}')
-    d = {}
-    d['rope.freqs'] = rope_freqs
-    for k, v in model.state_dict().items():
-        if k.startswith('module.'): k = k[7:]
-        d[k] = v
+    '''
+    given a model, save it if rank is 0
+    '''
     # save model weights.
-    if get_data_parallel_rank() == 0:
+    if get_data_parallel_rank() == 0: # is this fairscale rank local or global?
+        if os.path.isdir(checkpoint_dir) == False:
+            os.system(f'mkdir -p {checkpoint_dir}') # no need to mkdir before running
+
+        d = {}
+        d['rope.freqs'] = rope_freqs # what is this?
+        for k, v in model.state_dict().items():
+            if k.startswith('module.'):
+                k = k[7:] # 7==len('module.')
+            d[k] = v
+
         filename = f'{checkpoint_dir}/model-rank-{get_model_parallel_rank()}.pth'
         torch.save(d, filename)
 
 def init_model_weights(model):
+    '''
+    given a model, set its parameters' value
+    '''
     for name, param in model.named_parameters():
         if name.find('norm.weight') > -1:
             param.data[:] = 0.5 # based on llama7b pretrained.
@@ -84,14 +98,18 @@ def init_model_weights(model):
             raise ValueError(name)
 
 def train(args):
+    '''
+    the function - super long function
+    '''
+    print(args)
 
     # init dist.
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
-    if not model_parallel_is_initialized():
+    if not model_parallel_is_initialized(): # fairscale
         initialize_model_parallel(1)
 
-    # env
+    # env from torchrun
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", -1))
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     assert local_rank > -1
@@ -101,6 +119,7 @@ def train(args):
     #
     if global_rank > 0:
         # disable logging on worker machines.
+        # why not keep local-rank-0 print?
         sys.stdout = open(os.devnull, "w")
         sys.stderr = open(os.devnull, "w")
         pass
@@ -108,10 +127,11 @@ def train(args):
     # sanity checks
     if args.global_batch_size == -1:
         # not using gradient accumulation.
-        args.global_batch_size = args.micro_batch_size * get_data_parallel_world_size()
+        args.global_batch_size = args.micro_batch_size * get_data_parallel_world_size() # 没有 global batch size 的 config，从 micro batch 算一个 global batch size
     else:
         # may use gradient accumulation.
         assert args.global_batch_size % (get_data_parallel_world_size() * args.micro_batch_size) == 0, f'{args.global_batch_size=}, {args.micro_batch_size=}, {get_data_parallel_world_size()}'
+        # global batch 是 micro batch x world size 的整数倍
 
     # set cuda device for this process.
     torch.cuda.set_device(local_rank)
@@ -139,7 +159,7 @@ def train(args):
     loginfo(f'Logging into {logfile}')
 
     # model arguments
-    with open(f"{args.load_ckpt_dir}/params.json", "r") as f:
+    with open(f"{args.load_ckpt_dir}/params.json", "r") as f: # 这是llama2的文件，所以load_ckpt_dir是llama2
         params = json.loads(f.read())
         loginfo(f'params: {params}')
     model_args = ModelArgs(
@@ -150,7 +170,7 @@ def train(args):
         **params)
 
     # tokenizer
-    tokenizer_path='docker_data/llama2_7b_base/tokenizer.model'
+    tokenizer_path=args.tokenizer_model  # 用llama2的
     tokenizer = Tokenizer(model_path=tokenizer_path)
     model_args.vocab_size = tokenizer.n_words
 
@@ -160,6 +180,7 @@ def train(args):
     loginfo(f"Created transormer: {torch.cuda.memory_allocated('cuda')/1024**2:.1f} MB")
 
 
+    ########################
     # init model weights
     if False:
         # random init
@@ -170,12 +191,12 @@ def train(args):
         t0 = time.time()
         print('Loading checkpoinit')
         for ckpt_dir, m in [(args.load_ckpt_dir, model), (None, None)]:
-            if not m: continue
+            if not m:
+                continue
             checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
             assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-            assert args.model_parallel_size == len(
-                checkpoints
-            ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {args.model_parallel_size}"
+            assert args.model_parallel_size == len(checkpoints), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {args.model_parallel_size}"
+            # 它说pth文件的个数==传进来的参数model_parallel_size，这个值是1，因为llama2下载的pth个数是1
             ckpt_path = checkpoints[get_model_parallel_rank()]
             ckpt_data = torch.load(ckpt_path, map_location="cpu")
             """
@@ -208,26 +229,32 @@ def train(args):
 
     # seed must be the same in all processes
     seed = 1234
-    if 'seed' in ckpt_data: seed = ckpt_data['seed']
+    if 'seed' in ckpt_data: 
+        seed = ckpt_data['seed']
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
+    ########################
     # optimizer
     if 'base_optimizer_arguments' in ckpt_data:
         base_optimizer_arguments = ckpt_data['base_optimizer_arguments']
     else:
-        base_optimizer_arguments = {"betas": (0.9, 0.999), "lr": args.max_lr,
-                                    "weight_decay": 1e-3, "eps": 1e-8}
+        base_optimizer_arguments = {
+            "betas": (0.9, 0.999),
+            "lr": args.max_lr,
+            "weight_decay": 1e-3,
+            "eps": 1e-8,
+        }
     base_optimizer = torch.optim.AdamW
 
-
+    ########################
     # full parameters training
     if args.train_ddp:
         optimizer = base_optimizer(
             model.parameters(),
             **base_optimizer_arguments)
-    else:
+    else: # False, go this branch
         optimizer = OSS(
             model.parameters(),
             optim=base_optimizer,
@@ -236,10 +263,12 @@ def train(args):
     loginfo(f"Created optimizer: {base_optimizer_arguments=}")
 
 
+    ########################
     # dataset
-    if args.train_sft:
+    if args.train_sft: # set in *.sh, True, go this branch
+        # Supervised fine-tuning (SFT)
         # training with sft data
-        data_file = 'data/train_data.txt'
+        data_file = 'data/train_data.txt' # this file is generated by process_financial_phrasebank.py
         dataset = SFTData(
             seed,
             data_file,
@@ -265,6 +294,7 @@ def train(args):
         iter_steps = None
     loginfo(f"Data loader: {torch.cuda.memory_allocated('cuda')/1024**2:.1f} MB. resume_steps={iter_steps}")
 
+    ########################
     # scheduler
     warmup_steps = int((args.warmup_tokens_b*1e9)//args.global_batch_size//args.max_seq_len)
     first_cycle_steps = int((args.first_cycle_tokens_b*1e9)//args.global_batch_size//args.max_seq_len)
@@ -277,16 +307,18 @@ def train(args):
         warmup_steps=warmup_steps,
         gamma=0.5)
 
+    ########################
     # loss function
     criterion = torch.nn.CrossEntropyLoss(
         reduction="mean",
         ignore_index=tokenizer.pad_id)
 
+    ########################
     # ddp
     if args.train_ddp:
         model2 = DDP(model, find_unused_parameters=True)
-    else:
-        model = ShardedDDP(
+    else: # False, go this branch
+        model = ShardedDDP( # fairscale
             model,
             optimizer,
             reduce_buffer_size=4000000, # 1M to 8M is usually reasonable, 0 if disabled (default). 
@@ -295,13 +327,9 @@ def train(args):
         )
     loginfo(f"Wrap ShardedDataParallel: {torch.cuda.memory_allocated('cuda')/1024**2:.1f} MB")
 
+    ########################
     # build gradient tracker map
-    gradient_tags = ['tok_embeddings.weight', 'output.weight'] +\
-        [f'layers.{k}.attention.wq.weight' for k in range(0,100,5)] +\
-        [f'layers.{k}.attention.wk.weight' for k in range(0,100,5)] +\
-        [f'layers.{k}.attention.wv.weight' for k in range(0,100,5)] +\
-        [f'layers.{k}.attention.wo.weight' for k in range(0,100,5)] +\
-        [f'layers.{k}.feed_forward.w3.weight' for k in range(0,100,5)]
+    gradient_tags = ['tok_embeddings.weight', 'output.weight'] + [f'layers.{k}.attention.wq.weight' for k in range(0,100,5)] + [f'layers.{k}.attention.wk.weight' for k in range(0,100,5)] + [f'layers.{k}.attention.wv.weight' for k in range(0,100,5)] + [f'layers.{k}.attention.wo.weight' for k in range(0,100,5)] + [f'layers.{k}.feed_forward.w3.weight' for k in range(0,100,5)]
     gradient_map = {}
     index = 0
     for name, param in model.named_parameters():
@@ -314,6 +342,7 @@ def train(args):
             gradient_map[name] = index
             index += 1
 
+    ########################
     # tensorboard
     if global_rank == 0:
         if not os.path.isdir(f'{args.save_ckpt_dir}/tb'):
@@ -329,6 +358,7 @@ def train(args):
 
     # freeze backbone if training embedding only.
 
+    ########################
     # init training states
     num_grad_accumulate_steps = args.global_batch_size // (get_data_parallel_world_size() * args.micro_batch_size)
     loginfo(f'{num_grad_accumulate_steps=}, {args.micro_batch_size=}, {args.global_batch_size=}')
@@ -358,6 +388,7 @@ def train(args):
         global_num_tokens_consumed = ckpt_data['global_num_tokens_consumed']
         loginfo(f'Resumed from {global_num_tokens_consumed=:,}')
 
+    ########################
     ### Start training
     loginfo(f'model_args: {model_args}')
     torch.cuda.reset_peak_memory_stats()
@@ -399,7 +430,9 @@ def train(args):
                     json.dump(vars(args), fp)
                 os.system(f'cp {tokenizer_path} {checkpoint_dir}')
                 loginfo(f'\n\n==========================\nSaved checkpoint to {checkpoint_dir} at {global_num_tokens_consumed=:,}.\n')
-            break
+            break # 这是唯一跳出 while true 的地方
+        
+        
         dt_data = time.time() - t0
         dt_acc += dt_data
         if dummy_x is None:
@@ -407,6 +440,8 @@ def train(args):
             dummy_x = torch.clone(x)
             dummy_y = torch.clone(y)
             dummy_y[:,-1] = tokenizer.pad_id
+        
+        ########################
         def execute_forward_backward(num_nans):
             dt_acc = 0
             t0 = time.time()
@@ -444,13 +479,15 @@ def train(args):
             loss /= num_grad_accumulate_steps
             loss.backward()
             return (lossval, num_nans, activation_memory, dt_acc)
+        
         ###
         iter_steps += 1
         if iter_steps % num_grad_accumulate_steps == 0:
             L, num_nans, activation_memory, _dt_acc = execute_forward_backward(num_nans)
             dt_acc += _dt_acc
             # clip gradients
-            if args.grad_clip > 0: optimizer.clip_grad_norm(args.grad_clip)
+            if args.grad_clip > 0:
+                optimizer.clip_grad_norm(args.grad_clip)
             # update model parameters
             optimizer.step()
             t0 = time.time()
@@ -462,6 +499,7 @@ def train(args):
             # doing grad accumulation locally
             with model.no_sync():
                 L, num_nans = execute_forward_backward(num_nans)
+        
         # next step
         t_stat_start = time.time()
         #statistics[0] += torch.numel(x) - sum([s[-1] for s in seq_len_list]) # remove padding
@@ -495,10 +533,10 @@ def train(args):
             tkps = total_token_consumed / (time.time() - t_start)
             loss = total_loss / get_data_parallel_world_size() / num_log_steps
             dt_data = total_data / get_data_parallel_world_size() / num_log_steps
-            current_lr = [f"{optimizer.param_groups[k]['lr']:.2E}"
-                          for k in range(len(optimizer.param_groups))]
+            current_lr = [f"{optimizer.param_groups[k]['lr']:.2E}" for k in range(len(optimizer.param_groups))]
             peak_memory_usage = torch.cuda.max_memory_allocated() / 1024 ** 3
             msg = f'{time_string} {loss=:.2f} {current_lr=} speed={int(tkps):,} elapsed={time.time()-t_start_global:.2f}s iters={batch_steps} {global_num_tokens_consumed=:,} {dt_data=:.2E} {total_num_nans=} {activation_memory=:.2f}G {mean_dt_helper=:.4f}s helper_time_ratio={mean_dt_helper/mean_dt_total:.4f}'
+            
             # tensorboard
             if global_rank == 0:
                 loginfo(msg)
@@ -510,9 +548,11 @@ def train(args):
                 writer.add_scalar('Speed', tkps, global_num_tokens_consumed)
                 writer.add_scalar('PeakMemoryUsage', peak_memory_usage, global_num_tokens_consumed)
                 writer.flush()
+            
             # reset
             t_start = time.time()
             statistics[:] = 0
+
         dt_acc += time.time() - t_stat_start
         dt_helpers.put(dt_acc)
         dt_total.put(time.time()-t_step_start)
@@ -524,28 +564,32 @@ if __name__ == "__main__":
     # set arguments.
     parser = argparse.ArgumentParser()
     parser.add_argument("--load_ckpt_dir", type=str, required=True)
-    parser.add_argument("--save_ckpt_dir", type=str, required=True)
+    parser.add_argument("--save_ckpt_dir", type=str, required=True) # write to global-0 and local-0
+
     parser.add_argument("--tokens_dir", type=str, required=True)
     parser.add_argument("--tokenizer_model", type=str, required=True)
+
     parser.add_argument("--tensor_type", type=str, required=True)
-    parser.add_argument("--model_parallel_size", type=int, default=1)
+
     parser.add_argument("--micro_batch_size", type=int, required=True)
     parser.add_argument("--global_batch_size", type=int, required=True)
+
+    parser.add_argument("--model_parallel_size", type=int, default=1)
     parser.add_argument("--prefetch_factor", type=int, default=5)
     #parser.add_argument("--max_seq_len", type=int, default=4*1024)
     parser.add_argument("--max_seq_len", type=int, default=128)
     parser.add_argument("--warmup_tokens_b", type=float, default=0.2)
     parser.add_argument("--first_cycle_tokens_b", type=float, default=15)
     parser.add_argument("--grad_clip", type=float, default=1)
-    parser.add_argument("--train_ddp", action="store_true", help="using pytorch ddp rather than ShardedDDP.")
-    parser.add_argument("--train_sft", action="store_true", help="train with sft data.")
     parser.add_argument("--max_lr", type=float, default=5e-5) # 5e-5
     parser.add_argument("--min_lr", type=float, default=5e-6)
     parser.add_argument("--n_offload_skips", type=int, default=0)
-    parser.add_argument("--activation", type=str, default="none",
-                        required=False, choices=["gpu_shard", "cpu_offload", "checkpoint", "none"])
-    parser.add_argument("--ckpt_save_tokens_b", type=float,
-                        default=1, help="how many tokens (b) to save and evaluate checkpoint.")
+    parser.add_argument("--activation", type=str, default="none", required=False, choices=["gpu_shard", "cpu_offload", "checkpoint", "none"])
+    parser.add_argument("--ckpt_save_tokens_b", type=float, default=1, help="how many tokens (b) to save and evaluate checkpoint.")
+
+    parser.add_argument("--train_ddp", action="store_true", help="using pytorch ddp rather than ShardedDDP.") # default False
+    parser.add_argument("--train_sft", action="store_true", help="train with sft data.") # default False
+
     args = parser.parse_args()
 
     # run training
