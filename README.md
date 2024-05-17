@@ -8,6 +8,8 @@ This project contains codes for the research paper title "Pre-trained Large Lang
 
 ## Data preprocessing
 - Split the train, val and test sets for the PhraseBank dataset: `process_financial_phrasebank.py`
+- The FinBERT webpage is https://github.com/ProsusAI/finBERT/blob/master/README.md.
+- The FinancialPhraseBank-v1.0 download webpage is https://www.researchgate.net/publication/251231364_FinancialPhraseBank-v10.
 
 ## Training
 - May need to tune some parameters accordingly.
